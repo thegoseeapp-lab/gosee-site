@@ -40,17 +40,18 @@
   eyes();
 
   // ── data ────────────────────────────────────────────────────────────────────────────────────────────────
-  const D = { bookings: [], models: [], priv: {}, clients: {}, settings: null, events: {} };
+  const D = { bookings: [], models: [], priv: {}, clients: {}, settings: null, events: {}, quotes: [] };
   const ui = { filter: "open", sel: null, q: "", payTab: "receipts", rec: null, receiptUrls: {}, payPick: new Set() };
 
   async function loadAll() {
     await sb.rpc("advance_bookings");
-    const [b, m, p, c, s] = await Promise.all([
+    const [b, m, p, c, s, q] = await Promise.all([
       sb.from("bookings").select("*").order("created_at", { ascending: false }).limit(2000),
       sb.from("models").select("*").order("created_at"),
       sb.from("model_private").select("*"),
       sb.from("clients").select("*"),
       sb.from("settings").select("*").eq("id", 1).single(),
+      sb.from("quote_requests").select("*").order("created_at", { ascending: false }).limit(500),
     ]);
     for (const r of [b, m, p, c, s]) if (r.error) throw r.error;
     D.bookings = b.data;
@@ -58,6 +59,7 @@
     D.priv = Object.fromEntries(p.data.map((x) => [x.model_id, x]));
     D.clients = Object.fromEntries(c.data.map((x) => [x.user_id, x]));
     D.settings = s.data;
+    D.quotes = q.error ? [] : q.data;
   }
   const model = (id) => D.models.find((m) => m.id === id) || { name: "؟" };
   const client = (b) => D.clients[b.client_user] || {};
@@ -107,10 +109,11 @@
     payments: '<rect x="2" y="6" width="20" height="13" rx="2"/><path d="M2 10h20M6 15h4"/>',
     models: '<circle cx="12" cy="8" r="4"/><path d="M4 21c1.5-4 4.5-6 8-6s6.5 2 8 6"/>',
     clients: '<path d="M3 21V8l9-5 9 5v13"/><path d="M9 21v-7h6v7"/>',
+    quotes: '<path d="M4 4h16v12H8l-4 4z"/><path d="M8 9h8M8 12h5"/>',
     settings: '<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/>',
   };
   const svg = (k) => `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICON[k]}</svg>`;
-  const PAGES = [["today", "لوحة اليوم"], ["bookings", "الطلبات"], ["payments", "المبالغ"], ["models", "المودلز"], ["clients", "العملاء"], ["settings", "الإعدادات"]];
+  const PAGES = [["today", "لوحة اليوم"], ["bookings", "الطلبات"], ["payments", "المبالغ"], ["models", "المودلز"], ["clients", "العملاء"], ["quotes", "طلبات العروض"], ["settings", "الإعدادات"]];
   const route = () => (location.hash.replace(/^#\/?/, "").split("/")[0] || "today");
 
   function renderMenu() {
@@ -118,14 +121,14 @@
     const waiting = D.bookings.filter((b) => b.status === "pending").length;
     const money = D.bookings.filter(isReceipt).length + D.bookings.filter((b) => b.payout_status === "due").length + D.bookings.filter((b) => b.refund_status === "due").length;
     const pending = D.models.filter((m) => !m.verified && m.status === "active").length;
-    const counts = { bookings: waiting, payments: money, models: pending };
+    const counts = { bookings: waiting, payments: money, models: pending, quotes: D.quotes.filter((q) => q.status === "new").length };
     $("menu").innerHTML = PAGES.map(([k, t]) => `<a href="#/${k}" class="${r === k ? "on" : ""}" ${r === k ? 'aria-current="page"' : ""}>${svg(k)}${t}${counts[k] ? `<span class="count">${counts[k]}</span>` : ""}</a>`).join("");
   }
 
   function render() {
     renderMenu();
     const r = route();
-    const page = { today: pageToday, bookings: pageBookings, payments: pagePayments, models: pageModels, clients: pageClients, settings: pageSettings }[r] || pageToday;
+    const page = { today: pageToday, bookings: pageBookings, payments: pagePayments, models: pageModels, clients: pageClients, quotes: pageQuotes, settings: pageSettings }[r] || pageToday;
     $("main").innerHTML = page();
     after[r]?.();
   }
@@ -356,6 +359,22 @@
       </tbody></table></div></section>`;
   }
 
+  // ── quote requests (bigger shoots from the site's «طلب عرض سعر») ─────────────────────────────────────────
+  const Q_STATE = { new: ["pending", "جديد"], contacted: ["approved", "تم التواصل"], done: ["completed", "منتهي"] };
+  const CAT = { jewelry: "مجوهرات", abaya: "عبايات", dresses: "فساتين", makeup: "ميكب", clinic: "إعلانات عيادات", hand: "مودل يد", kids: "منتجات أطفال", sweets: "حلويات ومطاعم", menswear: "أزياء رجالية" };
+  function pageQuotes() {
+    const list = D.quotes;
+    return `<header class="head"><h1>طلبات العروض</h1><span class="sub">${list.length} طلب · ${list.filter((q) => q.status === "new").length} جديد</span></header>
+      <section class="card" style="padding:0"><div class="table-box">${list.length ? `<table><thead><tr><th>الطالب</th><th>الجوال</th><th>التصوير</th><th>التفاصيل</th><th>الحالة</th><th>وصل</th><th></th></tr></thead><tbody>
+        ${list.map((q) => { const [k, t] = Q_STATE[q.status] || Q_STATE.new; return `<tr><td><b>${esc(q.name)}</b>${q.company ? `<br><small class="note">${esc(q.company)}</small>` : ""}</td>
+          <td class="ltr"><a href="${wa(q.phone)}" target="_blank" rel="noopener">${esc(q.phone)}</a></td>
+          <td>${q.models_count} مودل${q.hours ? ` · ${hoursLabel(q.hours)}` : ""}${q.shoot_date ? `<br><small class="note">${dayLabel(q.shoot_date)}</small>` : ""}${(q.categories || []).length ? `<br><small class="note">${q.categories.map((c) => CAT[c] || c).join("، ")}</small>` : ""}</td>
+          <td style="max-width:320px;white-space:pre-wrap">${esc(q.details || "")}${q.admin_note ? `<br><small class="note">ملاحظة: ${esc(q.admin_note)}</small>` : ""}</td>
+          <td><span class="pill s-${k}">${t}</span></td><td>${ago(q.created_at)}</td>
+          <td><div class="actions">${q.status !== "contacted" ? `<button class="btn small" data-act="quote" data-id="${q.id}" data-to="contacted">تم التواصل</button>` : ""}${q.status !== "done" ? `<button class="btn small" data-act="quote" data-id="${q.id}" data-to="done">منتهي</button>` : ""}<button class="btn small" data-act="quote-note" data-id="${q.id}">ملاحظة</button></div></td></tr>`; }).join("")}
+      </tbody></table>` : `<p class="empty">لا طلبات بعد. تصل هنا من صفحة «طلب عرض سعر» في الموقع.</p>`}</div></section>`;
+  }
+
   // ── clients ─────────────────────────────────────────────────────────────────────────────────────────────
   function pageClients() {
     const list = Object.values(D.clients).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
@@ -426,6 +445,21 @@
 
   const ACT = {
     refresh: () => refresh().then(() => toast("تم التحديث")),
+    quote: async (el) => {
+      const { error } = await sb.from("quote_requests").update({ status: el.dataset.to, updated_at: new Date().toISOString() }).eq("id", el.dataset.id);
+      if (error) return toast(`تعذر الحفظ: ${error.message}`);
+      await refresh();
+      toast("تم");
+    },
+    "quote-note": async (el) => {
+      const q = D.quotes.find((x) => x.id === el.dataset.id);
+      const v = await ask("ملاحظة على الطلب", [{ id: "note", label: "الملاحظة (لك فقط)", area: true, value: q.admin_note || "" }], "حفظ");
+      if (!v) return;
+      const { error } = await sb.from("quote_requests").update({ admin_note: v.note, updated_at: new Date().toISOString() }).eq("id", q.id);
+      if (error) return toast(`تعذر الحفظ: ${error.message}`);
+      await refresh();
+      toast("حُفظت الملاحظة");
+    },
     "save-note": (el) => call("admin_set_note", { p_id: el.dataset.id, p_note: $("admin-note").value }, "حُفظت الملاحظة"),
     "admin-cancel": async (el) => {
       const b = D.bookings.find((x) => x.id === el.dataset.id);
